@@ -1,8 +1,10 @@
 # documentdb-batchinsert-s3objs-lambda
 
-AWS-Lambda-Funktion, die per **PUT**-Request ein JSON-Array von S3-Pfaden entgegennimmt, die referenzierten JSON-Dateien aus S3 liest und alle enthaltenen Objekte als Dokumente in **Amazon DocumentDB** speichert.
+AWS-Lambda-Funktion, die per **PUT**-Request ein JSON-Array von S3-Pfaden entgegennimmt, die referenzierten JSON-Dateien aus S3 liest und alle enthaltenen Objekte als Items in **Amazon DynamoDB** speichert.
 
-Jedes eingefügte Dokument erhält ein zusätzliches Feld `_source` mit dem kanonischen S3-Pfad der Quelldatei.
+Jedes eingefügte Item erhält ein zusätzliches Feld `_source` mit dem kanonischen S3-Pfad der Quelldatei.
+
+Standard-Zieltabelle: `arn:aws:dynamodb:eu-central-1:423623826655:table/data`
 
 ## Verhalten (Spezifikation)
 
@@ -60,11 +62,17 @@ Für jeden S3-Pfad:
 
 1. Datei aus S3 laden
 2. JSON parsen und als Array validieren
-3. Für jedes Array-Element ein Dokument erzeugen
+3. Für jedes Array-Element ein DynamoDB-Item erzeugen
 4. `_source` mit dem kanonischen Pfad `s3://bucket/key` setzen
-5. Alle Dokumente in die konfigurierte DocumentDB-Collection einfügen
+5. Alle Items per `batch_writer` in die konfigurierte DynamoDB-Tabelle schreiben
 
-Aus zwei S3-Dateien mit insgesamt drei Objekten entstehen **drei separate DocumentDB-Dokumente**.
+Aus zwei S3-Dateien mit insgesamt drei Objekten entstehen **drei separate DynamoDB-Items**.
+
+### Partition Key
+
+Standardmäßig wird `id` als Partition Key verwendet. Fehlt `id` in einem Objekt, wird automatisch eine UUID gesetzt.
+
+Die Tabelle `data` sollte daher mindestens einen String-Partition-Key `id` haben. Falls deine Tabelle einen anderen Key-Namen nutzt, setze `DYNAMODB_PARTITION_KEY` entsprechend.
 
 ### Ausgabe (erfolgreich)
 
@@ -72,6 +80,7 @@ Aus zwei S3-Dateien mit insgesamt drei Objekten entstehen **drei separate Docume
 {
   "pathsProcessed": 2,
   "documentsInserted": 3,
+  "table": "data",
   "results": [
     {
       "source": "s3://news-archive-bucket/feeds/example/2026-06-01-batch-1.json",
@@ -87,7 +96,7 @@ Aus zwei S3-Dateien mit insgesamt drei Objekten entstehen **drei separate Docume
 }
 ```
 
-### Erwartete DocumentDB-Dokumente
+### Erwartete DynamoDB-Items
 
 Die vollständige erwartete Ausgabe für die Beispiel-Fixtures liegt in `tests/fixtures/expected_documents.json`:
 
@@ -121,22 +130,21 @@ Die vollständige erwartete Ausgabe für die Beispiel-Fixtures liegt in `tests/f
 | Leerer oder ungültiger Request-Body | 400 | `{"error": "Request body must be a JSON array of S3 paths"}` |
 | S3-Objekt nicht gefunden | 400 | `{"error": "S3 get_object failed for s3://..."}` |
 | JSON ist kein Array | 400 | `{"error": "S3 object s3://... must contain a JSON array"}` |
-| DocumentDB-Fehler | 500 | `{"error": "DocumentDB error: ..."}` |
+| DynamoDB-Fehler | 500 | `{"error": "DynamoDB error: ..."}` |
 
 ## Umgebungsvariablen
 
-| Variable | Pflicht | Beschreibung |
-|----------|---------|--------------|
-| `DOCUMENTDB_URI` | ja | MongoDB-Connection-String für DocumentDB |
-| `DOCUMENTDB_DATABASE` | ja | Zieldatenbank |
-| `DOCUMENTDB_COLLECTION` | ja | Ziel-Collection |
-| `DOCUMENTDB_TLS_CA_FILE` | nein | Pfad zum RDS-TLS-Bundle (Default: `/var/task/global-bundle.pem`) |
-| `S3_BUCKET` | nein | Default-Bucket für reine Objekt-Keys ohne `s3://`-Präfix |
-| `AWS_REGION` | nein | AWS-Region (Default: `eu-central-1`) |
+| Variable | Pflicht | Default | Beschreibung |
+|----------|---------|---------|--------------|
+| `DYNAMODB_TABLE` | nein | `data` | Name der Ziel-Tabelle |
+| `DYNAMODB_TABLE_ARN` | nein | `arn:aws:dynamodb:eu-central-1:423623826655:table/data` | Tabellen-ARN (wird genutzt, wenn `DYNAMODB_TABLE` nicht gesetzt ist) |
+| `DYNAMODB_PARTITION_KEY` | nein | `id` | Attributname des Partition Keys |
+| `S3_BUCKET` | nein | — | Default-Bucket für reine Objekt-Keys ohne `s3://`-Präfix |
+| `AWS_REGION` | nein | `eu-central-1` | AWS-Region |
 
 ## Projektstruktur
 
-- `Dockerfile` – Lambda-Runtime-Image (Python 3.11) inkl. RDS-TLS-Bundle
+- `Dockerfile` – Lambda-Runtime-Image (Python 3.11)
 - `function/` – Anwendungscode und `requirements.txt`
 - `tests/` – Unit-Tests und Beispiel-Fixtures als lebende Spezifikation
 - `Jenkinsfile` – Pipeline (ECR-Login, Build, Push, Lambda-Deploy)
@@ -172,5 +180,4 @@ Angepasste Werte in der `Jenkinsfile`:
 Die Lambda-Rolle benötigt mindestens:
 
 - `s3:GetObject` auf die relevanten Buckets/Keys
-- Netzwerkzugriff auf DocumentDB (typischerweise innerhalb desselben VPC)
-- Optional: `ec2:CreateNetworkInterface` usw., wenn die Funktion in einem VPC läuft
+- `dynamodb:BatchWriteItem` und `dynamodb:PutItem` auf `arn:aws:dynamodb:eu-central-1:423623826655:table/data`

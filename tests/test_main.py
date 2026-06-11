@@ -8,7 +8,7 @@ from botocore.exceptions import ClientError
 
 from function.main import (
     handler,
-    insert_documents,
+    insert_items,
     load_json_array_from_s3,
     parse_request_paths,
     parse_s3_path,
@@ -28,6 +28,15 @@ def _load_fixture(name: str):
 def _load_s3_fixture(name: str):
     with (S3_FIXTURES_DIR / name).open(encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _mock_dynamodb_table():
+    table = MagicMock()
+    table.name = "data"
+    batch = MagicMock()
+    table.batch_writer.return_value.__enter__.return_value = batch
+    table.batch_writer.return_value.__exit__.return_value = None
+    return table, batch
 
 
 class TestParseS3Path:
@@ -141,26 +150,29 @@ class TestProcessS3Paths:
 
         s3_client.get_object.side_effect = get_object_side_effect
 
-        collection = MagicMock()
-        inserted_batches: list[list[dict]] = []
+        table, batch = _mock_dynamodb_table()
+        inserted_items: list[dict] = []
 
-        def insert_many_side_effect(documents):
-            inserted_batches.append(documents)
-            result = MagicMock()
-            result.inserted_ids = list(range(len(documents)))
-            return result
+        def put_item_side_effect(*, Item):
+            inserted_items.append(Item)
 
-        collection.insert_many.side_effect = insert_many_side_effect
+        batch.put_item.side_effect = put_item_side_effect
 
         paths = [
             "s3://news-archive-bucket/feeds/example/2026-06-01-batch-1.json",
             "s3://news-archive-bucket/feeds/example/2026-06-01-batch-2.json",
         ]
-        summary = process_s3_paths(paths, s3_client=s3_client, collection=collection)
+        summary = process_s3_paths(
+            paths,
+            s3_client=s3_client,
+            table=table,
+            partition_key="id",
+        )
 
         assert summary == {
             "pathsProcessed": 2,
             "documentsInserted": 3,
+            "table": "data",
             "results": [
                 {
                     "source": paths[0],
@@ -175,40 +187,33 @@ class TestProcessS3Paths:
             ],
         }
 
-        flattened = [document for batch in inserted_batches for document in batch]
-        assert flattened == expected_documents
+        assert inserted_items == expected_documents
 
 
-class TestInsertDocuments:
+class TestInsertItems:
     def test_returns_zero_for_empty_list(self):
-        collection = MagicMock()
-        assert insert_documents(collection, []) == 0
-        collection.insert_many.assert_not_called()
+        table, batch = _mock_dynamodb_table()
+        assert insert_items(table, [], "id") == 0
+        table.batch_writer.assert_not_called()
 
 
 class TestHandler:
     def test_returns_200_with_summary(self, monkeypatch):
-        monkeypatch.setenv("DOCUMENTDB_URI", "mongodb://localhost:27017")
-        monkeypatch.setenv("DOCUMENTDB_DATABASE", "news")
-        monkeypatch.setenv("DOCUMENTDB_COLLECTION", "articles")
-
-        collection = MagicMock()
-        collection.insert_many.return_value.inserted_ids = [1, 2]
-
-        monkeypatch.setattr(
-            "function.main._create_documentdb_collection",
-            lambda settings: collection,
-        )
+        table, batch = _mock_dynamodb_table()
+        monkeypatch.setattr("function.main._get_dynamodb_table", lambda settings: table)
 
         batch = _load_s3_fixture("articles_batch_1.json")
         s3_client = MagicMock()
         s3_client.get_object.return_value = {
             "Body": BytesIO(json.dumps(batch).encode("utf-8"))
         }
-        monkeypatch.setattr(
-            "function.main.boto3.client",
-            lambda service_name, region_name=None: s3_client,
-        )
+
+        def client_factory(service_name, region_name=None):
+            if service_name == "s3":
+                return s3_client
+            raise AssertionError(f"Unexpected client: {service_name}")
+
+        monkeypatch.setattr("function.main.boto3.client", client_factory)
 
         event = {
             "body": json.dumps(
@@ -221,12 +226,9 @@ class TestHandler:
         body = json.loads(response["body"])
         assert body["pathsProcessed"] == 1
         assert body["documentsInserted"] == 2
+        assert body["table"] == "data"
 
-    def test_returns_400_for_invalid_request(self, monkeypatch):
-        monkeypatch.setenv("DOCUMENTDB_URI", "mongodb://localhost:27017")
-        monkeypatch.setenv("DOCUMENTDB_DATABASE", "news")
-        monkeypatch.setenv("DOCUMENTDB_COLLECTION", "articles")
-
+    def test_returns_400_for_invalid_request(self):
         response = handler({"body": "{}"}, None)
 
         assert response["statusCode"] == 400

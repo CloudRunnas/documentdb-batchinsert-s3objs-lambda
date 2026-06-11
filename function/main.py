@@ -2,20 +2,21 @@ import json
 import logging
 import os
 import re
+import uuid
+from decimal import Decimal
 from typing import Any
 from urllib.parse import unquote
 
 import boto3
 from botocore.exceptions import ClientError
-from pymongo import MongoClient
-from pymongo.collection import Collection
-from pymongo.errors import PyMongoError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 _S3_URI_PATTERN = re.compile(r"^s3://([^/]+)/(.+)$")
-_DEFAULT_TLS_CA_FILE = "/var/task/global-bundle.pem"
+_DEFAULT_DYNAMODB_TABLE_ARN = "arn:aws:dynamodb:eu-central-1:423623826655:table/data"
+_DEFAULT_DYNAMODB_TABLE_NAME = "data"
+_DEFAULT_DYNAMODB_PARTITION_KEY = "id"
 
 
 def _aws_region() -> str:
@@ -32,6 +33,13 @@ def _default_bucket_name() -> str | None:
         if value:
             return value.strip()
     return None
+
+
+def _table_name_from_arn(arn: str) -> str | None:
+    parts = arn.split(":")
+    if len(parts) < 6 or parts[2] != "dynamodb" or not parts[5].startswith("table/"):
+        return None
+    return parts[5].split("/", 1)[1]
 
 
 def parse_s3_path(path: str, default_bucket: str | None = None) -> tuple[str, str]:
@@ -134,21 +142,51 @@ def prepare_documents(
     return documents
 
 
-def insert_documents(collection: Collection, documents: list[dict[str, Any]]) -> int:
+def _convert_for_dynamodb(value: Any) -> Any:
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {key: _convert_for_dynamodb(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_convert_for_dynamodb(item) for item in value]
+    return value
+
+
+def _ensure_partition_key(document: dict[str, Any], partition_key: str) -> dict[str, Any]:
+    item = dict(document)
+    if partition_key not in item or item[partition_key] in (None, ""):
+        item[partition_key] = str(uuid.uuid4())
+    return item
+
+
+def insert_items(
+    table: Any,
+    documents: list[dict[str, Any]],
+    partition_key: str,
+) -> int:
     if not documents:
         return 0
-    result = collection.insert_many(documents)
-    return len(result.inserted_ids)
+
+    inserted = 0
+    with table.batch_writer() as batch:
+        for document in documents:
+            item = _convert_for_dynamodb(
+                _ensure_partition_key(document, partition_key)
+            )
+            batch.put_item(Item=item)
+            inserted += 1
+    return inserted
 
 
 def process_s3_paths(
     paths: list[str],
     *,
     s3_client: Any,
-    collection: Collection,
+    table: Any,
+    partition_key: str,
     default_bucket: str | None = None,
 ) -> dict[str, Any]:
-    """Read all S3 objects and insert their array items into DocumentDB."""
+    """Read all S3 objects and insert their array items into DynamoDB."""
     per_path_results: list[dict[str, Any]] = []
     total_documents = 0
 
@@ -157,7 +195,7 @@ def process_s3_paths(
         canonical_source = f"s3://{bucket}/{key}"
         items = load_json_array_from_s3(s3_client, bucket, key)
         documents = prepare_documents(items, canonical_source)
-        inserted = insert_documents(collection, documents)
+        inserted = insert_items(table, documents, partition_key)
         total_documents += inserted
         per_path_results.append(
             {
@@ -170,43 +208,34 @@ def process_s3_paths(
     return {
         "pathsProcessed": len(paths),
         "documentsInserted": total_documents,
+        "table": table.name,
         "results": per_path_results,
     }
 
 
-def _documentdb_settings() -> dict[str, str]:
-    uri = os.environ.get("DOCUMENTDB_URI", "").strip()
-    database = os.environ.get("DOCUMENTDB_DATABASE", "").strip()
-    collection = os.environ.get("DOCUMENTDB_COLLECTION", "").strip()
-    missing = [
-        name
-        for name, value in (
-            ("DOCUMENTDB_URI", uri),
-            ("DOCUMENTDB_DATABASE", database),
-            ("DOCUMENTDB_COLLECTION", collection),
-        )
-        if not value
-    ]
-    if missing:
-        raise RuntimeError(
-            "Missing required environment variables: " + ", ".join(missing)
-        )
+def _dynamodb_settings() -> dict[str, str]:
+    table_name = os.environ.get("DYNAMODB_TABLE", "").strip()
+    if not table_name:
+        table_arn = os.environ.get(
+            "DYNAMODB_TABLE_ARN",
+            _DEFAULT_DYNAMODB_TABLE_ARN,
+        ).strip()
+        table_name = _table_name_from_arn(table_arn) or _DEFAULT_DYNAMODB_TABLE_NAME
+
+    partition_key = (
+        os.environ.get("DYNAMODB_PARTITION_KEY", _DEFAULT_DYNAMODB_PARTITION_KEY).strip()
+        or _DEFAULT_DYNAMODB_PARTITION_KEY
+    )
     return {
-        "uri": uri,
-        "database": database,
-        "collection": collection,
-        "tls_ca_file": os.environ.get("DOCUMENTDB_TLS_CA_FILE", _DEFAULT_TLS_CA_FILE),
+        "table_name": table_name,
+        "partition_key": partition_key,
+        "region": _aws_region(),
     }
 
 
-def _create_documentdb_collection(settings: dict[str, str]) -> Collection:
-    client = MongoClient(
-        settings["uri"],
-        tls=True,
-        tlsCAFile=settings["tls_ca_file"],
-        retryWrites=False,
-    )
-    return client[settings["database"]][settings["collection"]]
+def _get_dynamodb_table(settings: dict[str, str]) -> Any:
+    resource = boto3.resource("dynamodb", region_name=settings["region"])
+    return resource.Table(settings["table_name"])
 
 
 def _http_response(status_code: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -225,21 +254,23 @@ def handler(event: dict[str, Any] | list[str], context: Any) -> dict[str, Any]:
         return _http_response(400, {"error": str(exc)})
 
     try:
-        settings = _documentdb_settings()
-        collection = _create_documentdb_collection(settings)
-        s3_client = boto3.client("s3", region_name=_aws_region())
+        settings = _dynamodb_settings()
+        table = _get_dynamodb_table(settings)
+        s3_client = boto3.client("s3", region_name=settings["region"])
         summary = process_s3_paths(
             paths,
             s3_client=s3_client,
-            collection=collection,
+            table=table,
+            partition_key=settings["partition_key"],
             default_bucket=_default_bucket_name(),
         )
     except (RuntimeError, ValueError) as exc:
         logger.error("%s", exc)
         return _http_response(400, {"error": str(exc)})
-    except PyMongoError as exc:
-        logger.exception("DocumentDB insert failed")
-        return _http_response(500, {"error": f"DocumentDB error: {exc}"})
+    except ClientError as exc:
+        logger.exception("DynamoDB write failed")
+        message = exc.response["Error"].get("Message", str(exc))
+        return _http_response(500, {"error": f"DynamoDB error: {message}"})
     except Exception as exc:  # noqa: BLE001
         logger.exception("Unhandled error while processing S3 paths")
         return _http_response(500, {"error": str(exc)})
