@@ -8,7 +8,7 @@ pipeline {
         ECR_REGISTRY = '423623826655.dkr.ecr.eu-central-1.amazonaws.com'
         ECR_REPOSITORY = 'dflowp/documentdb-batchinsert-s3objs-lambda'
         LAMBDA_FUNCTION_NAME = 'documentdb-batchinsert-s3objs-lambda'
-        LAMBDA_ROLE_ARN = 'arn:aws:iam::423623826655:role/service-role/documentdb-batchinsert-s3objs-lambda-role'
+        LAMBDA_ROLE_ARN = 'arn:aws:iam::423623826655:role/service-role/rss-lamda-role-if7gg0ib'
         IMAGE_URI = "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
     }
 
