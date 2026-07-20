@@ -17,6 +17,8 @@ env:
   ECR_REGISTRY: 423623826655.dkr.ecr.eu-central-1.amazonaws.com
   ECR_REPOSITORY: dflowp/documentdb-batchinsert-s3objs-lambda
   LAMBDA_ROLE_ARN: arn:aws:iam::423623826655:role/service-role/rss-lamda-role-if7gg0ib
+  SOURCE_TABLE: data
+  STAGING_TABLE: data_staging
 
 jobs:
   deploy:
@@ -41,11 +43,169 @@ jobs:
             echo "function_name=documentdb-batchinsert-s3objs-lambda-staging" >> "$GITHUB_OUTPUT"
             echo "image_tag=staging" >> "$GITHUB_OUTPUT"
             echo "staging=true" >> "$GITHUB_OUTPUT"
+            echo "dynamodb_table=${STAGING_TABLE}" >> "$GITHUB_OUTPUT"
           else
             echo "function_name=documentdb-batchinsert-s3objs-lambda" >> "$GITHUB_OUTPUT"
             echo "image_tag=latest" >> "$GITHUB_OUTPUT"
             echo "staging=false" >> "$GITHUB_OUTPUT"
+            echo "dynamodb_table=${SOURCE_TABLE}" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Ensure staging DynamoDB table
+        if: inputs.environment == 'staging'
+        run: |
+          set -euo pipefail
+          aws dynamodb describe-table --table-name "$SOURCE_TABLE" --region "$AWS_REGION" > /tmp/source-table.json
+
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+
+          region = os.environ["AWS_REGION"]
+          staging = os.environ["STAGING_TABLE"]
+
+          with open("/tmp/source-table.json", encoding="utf-8") as f:
+              src = json.load(f)["Table"]
+
+          billing = (src.get("BillingModeSummary") or {}).get("BillingMode") or "PAY_PER_REQUEST"
+
+          def gsi_create_entry(idx: dict) -> dict:
+              entry = {
+                  "IndexName": idx["IndexName"],
+                  "KeySchema": idx["KeySchema"],
+                  "Projection": idx["Projection"],
+              }
+              if billing != "PAY_PER_REQUEST":
+                  pt = idx.get("ProvisionedThroughput") or {}
+                  entry["ProvisionedThroughput"] = {
+                      "ReadCapacityUnits": pt.get("ReadCapacityUnits", 5),
+                      "WriteCapacityUnits": pt.get("WriteCapacityUnits", 5),
+                  }
+              return entry
+
+          def describe(table: str) -> dict | None:
+              proc = subprocess.run(
+                  [
+                      "aws",
+                      "dynamodb",
+                      "describe-table",
+                      "--table-name",
+                      table,
+                      "--region",
+                      region,
+                      "--output",
+                      "json",
+                  ],
+                  capture_output=True,
+                  text=True,
+              )
+              if proc.returncode != 0:
+                  return None
+              return json.loads(proc.stdout)["Table"]
+
+          existing = describe(staging)
+          if existing is None:
+              params = {
+                  "TableName": staging,
+                  "AttributeDefinitions": src["AttributeDefinitions"],
+                  "KeySchema": src["KeySchema"],
+                  "BillingMode": billing,
+              }
+              gsis = [gsi_create_entry(idx) for idx in (src.get("GlobalSecondaryIndexes") or [])]
+              if gsis:
+                  params["GlobalSecondaryIndexes"] = gsis
+              if billing != "PAY_PER_REQUEST":
+                  pt = src.get("ProvisionedThroughput") or {}
+                  params["ProvisionedThroughput"] = {
+                      "ReadCapacityUnits": pt.get("ReadCapacityUnits", 5),
+                      "WriteCapacityUnits": pt.get("WriteCapacityUnits", 5),
+                  }
+                  del params["BillingMode"]
+
+              with open("/tmp/create-table.json", "w", encoding="utf-8") as f:
+                  json.dump(params, f)
+              print(f"Creating {staging} …")
+              print(json.dumps(params, indent=2))
+              subprocess.check_call(
+                  [
+                      "aws",
+                      "dynamodb",
+                      "create-table",
+                      "--cli-input-json",
+                      "file:///tmp/create-table.json",
+                      "--region",
+                      region,
+                  ]
+              )
+              subprocess.check_call(
+                  [
+                      "aws",
+                      "dynamodb",
+                      "wait",
+                      "table-exists",
+                      "--table-name",
+                      staging,
+                      "--region",
+                      region,
+                  ]
+              )
+              print(f"Created {staging}")
+              existing = describe(staging)
+
+          existing_gsi = {i["IndexName"] for i in (existing.get("GlobalSecondaryIndexes") or [])}
+          missing = [
+              idx
+              for idx in (src.get("GlobalSecondaryIndexes") or [])
+              if idx["IndexName"] not in existing_gsi
+          ]
+          if not missing:
+              print(f"Table {staging} is ready (schema aligned)")
+              sys.exit(0)
+
+          attr_by_name = {
+              a["AttributeName"]: a for a in existing.get("AttributeDefinitions") or []
+          }
+          for a in src["AttributeDefinitions"]:
+              attr_by_name[a["AttributeName"]] = a
+
+          update = {
+              "TableName": staging,
+              "AttributeDefinitions": list(attr_by_name.values()),
+              "GlobalSecondaryIndexUpdates": [
+                  {"Create": gsi_create_entry(idx)} for idx in missing
+              ],
+          }
+          with open("/tmp/update-table.json", "w", encoding="utf-8") as f:
+              json.dump(update, f)
+          print(f"Adding missing GSIs to {staging}: {[i['IndexName'] for i in missing]}")
+          subprocess.check_call(
+              [
+                  "aws",
+                  "dynamodb",
+                  "update-table",
+                  "--cli-input-json",
+                  "file:///tmp/update-table.json",
+                  "--region",
+                  region,
+              ]
+          )
+          for _ in range(60):
+              current = describe(staging) or {}
+              status = current.get("TableStatus")
+              gsi_ok = all(
+                  i.get("IndexStatus") == "ACTIVE"
+                  for i in (current.get("GlobalSecondaryIndexes") or [])
+              )
+              if status == "ACTIVE" and gsi_ok:
+                  break
+              time.sleep(5)
+          else:
+              raise SystemExit(f"Timed out waiting for {staging} to become ACTIVE")
+          print(f"Updated {staging} GSIs")
+          PY
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -63,6 +223,7 @@ jobs:
           set -euo pipefail
           FN="${{ steps.target.outputs.function_name }}"
           STAGING="${{ steps.target.outputs.staging }}"
+          TABLE="${{ steps.target.outputs.dynamodb_table }}"
           if aws lambda get-function --function-name "$FN" --region "$AWS_REGION" >/dev/null 2>&1; then
             aws lambda update-function-code \
               --function-name "$FN" \
@@ -71,7 +232,7 @@ jobs:
             aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION"
             aws lambda update-function-configuration \
               --function-name "$FN" \
-              --environment "Variables={STAGING=${STAGING},DYNAMODB_TABLE=data,DYNAMODB_LINK_GSI=Link}" \
+              --environment "Variables={STAGING=${STAGING},DYNAMODB_TABLE=${TABLE},DYNAMODB_LINK_GSI=Link}" \
               --region "$AWS_REGION"
           else
             aws lambda create-function \
@@ -81,6 +242,6 @@ jobs:
               --role "$LAMBDA_ROLE_ARN" \
               --timeout 60 \
               --memory-size 256 \
-              --environment "Variables={STAGING=${STAGING},DYNAMODB_TABLE=data,DYNAMODB_LINK_GSI=Link}" \
+              --environment "Variables={STAGING=${STAGING},DYNAMODB_TABLE=${TABLE},DYNAMODB_LINK_GSI=Link}" \
               --region "$AWS_REGION"
           fi
