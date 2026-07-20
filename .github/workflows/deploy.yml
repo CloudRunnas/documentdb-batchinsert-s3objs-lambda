@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,16 +52,25 @@ jobs:
             echo "dynamodb_table=${SOURCE_TABLE}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.target.outputs.image_tag }}
+          cache-from: type=gha,scope=batch-insert-lambda
+          cache-to: type=gha,mode=max,scope=batch-insert-lambda
+
+      - name: Export image URI
         run: |
-          set -euo pipefail
-          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${{ steps.target.outputs.image_tag }}"
-          docker build -f Dockerfile -t "$IMAGE_URI" .
-          docker push "$IMAGE_URI"
-          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+          echo "IMAGE_URI=${ECR_REGISTRY}/${ECR_REPOSITORY}:${{ steps.target.outputs.image_tag }}" >> "$GITHUB_ENV"
 
       - name: Deploy Lambda
         run: |
