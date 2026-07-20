@@ -2,6 +2,7 @@
   {
     "id": "article-101",
     "title": "Dritter Artikel",
-    "category": "politics"
+    "category": "politics",
+    "link": "https://www.spiegel.de/politik/101"
   }
 ]

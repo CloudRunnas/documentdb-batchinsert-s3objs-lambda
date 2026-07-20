@@ -1,0 +1,86 @@
+name: Deploy Batch Insert Lambda
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REGISTRY: 423623826655.dkr.ecr.eu-central-1.amazonaws.com
+  ECR_REPOSITORY: dflowp/documentdb-batchinsert-s3objs-lambda
+  LAMBDA_ROLE_ARN: arn:aws:iam::423623826655:role/service-role/rss-lamda-role-if7gg0ib
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve target
+        id: target
+        run: |
+          if [ "${{ inputs.environment }}" = "staging" ]; then
+            echo "function_name=documentdb-batchinsert-s3objs-lambda-staging" >> "$GITHUB_OUTPUT"
+            echo "image_tag=staging" >> "$GITHUB_OUTPUT"
+            echo "staging=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "function_name=documentdb-batchinsert-s3objs-lambda" >> "$GITHUB_OUTPUT"
+            echo "image_tag=latest" >> "$GITHUB_OUTPUT"
+            echo "staging=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${{ steps.target.outputs.image_tag }}"
+          docker build -f Dockerfile -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+      - name: Deploy Lambda
+        run: |
+          set -euo pipefail
+          FN="${{ steps.target.outputs.function_name }}"
+          STAGING="${{ steps.target.outputs.staging }}"
+          if aws lambda get-function --function-name "$FN" --region "$AWS_REGION" >/dev/null 2>&1; then
+            aws lambda update-function-code \
+              --function-name "$FN" \
+              --image-uri "$IMAGE_URI" \
+              --region "$AWS_REGION"
+            aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION"
+            aws lambda update-function-configuration \
+              --function-name "$FN" \
+              --environment "Variables={STAGING=${STAGING},DYNAMODB_TABLE=data,DYNAMODB_LINK_GSI=Link}" \
+              --region "$AWS_REGION"
+          else
+            aws lambda create-function \
+              --function-name "$FN" \
+              --package-type Image \
+              --code "ImageUri=${IMAGE_URI}" \
+              --role "$LAMBDA_ROLE_ARN" \
+              --timeout 60 \
+              --memory-size 256 \
+              --environment "Variables={STAGING=${STAGING},DYNAMODB_TABLE=data,DYNAMODB_LINK_GSI=Link}" \
+              --region "$AWS_REGION"
+          fi
