@@ -2,11 +2,13 @@
   {
     "id": "article-001",
     "title": "Erster Artikel",
-    "publishedAt": "2026-06-01T10:00:00Z"
+    "publishedAt": "2026-06-01T10:00:00Z",
+    "link": "https://www.example.com/articles/001"
   },
   {
     "id": "article-002",
     "title": "Zweiter Artikel",
-    "publishedAt": "2026-06-01T11:00:00Z"
+    "publishedAt": "2026-06-01T11:00:00Z",
+    "link": "https://zeit.de/politik/002"
   }
 ]

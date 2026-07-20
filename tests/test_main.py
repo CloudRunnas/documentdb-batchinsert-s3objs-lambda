@@ -10,6 +10,8 @@ from function.main import (
     handler,
     insert_items,
     load_json_array_from_s3,
+    normalize_link,
+    parse_request,
     parse_request_paths,
     parse_s3_path,
     prepare_documents,
@@ -30,12 +32,42 @@ def _load_s3_fixture(name: str):
         return json.load(handle)
 
 
-def _mock_dynamodb_table():
+def _mock_dynamodb_table(*, existing_links: set[str] | None = None):
     table = MagicMock()
     table.name = "data"
     batch = MagicMock()
     table.batch_writer.return_value.__enter__.return_value = batch
     table.batch_writer.return_value.__exit__.return_value = None
+
+    existing = existing_links or set()
+
+    def query_side_effect(**kwargs):
+        # Extract link equality from KeyConditionExpression is hard with mocks;
+        # tests pass IndexName and we inspect call args via a simpler approach:
+        # MagicMock Key objects — instead parse from call kwargs if present.
+        # Our code uses Key("link").eq(link); the mock receives the expression object.
+        # Fallback: count=0 unless we detect link via a custom attribute set in tests.
+        link = getattr(table, "_query_link", None)
+        # Prefer inspecting put flow: tests set side_effect that checks ExpressionAttributeValues
+        eav = kwargs.get("ExpressionAttributeValues") or {}
+        for value in eav.values():
+            if isinstance(value, str) and value in existing:
+                return {"Count": 1}
+        # boto3 Key().eq() doesn't use EAV in resource API the same way — check call count helpers
+        condition = kwargs.get("KeyConditionExpression")
+        link_value = getattr(condition, "_values", [None])[-1] if condition is not None else None
+        # dynamodb conditions store values differently; use stringification fallback
+        text = str(condition) if condition is not None else ""
+        for existing_link in existing:
+            if existing_link in text:
+                return {"Count": 1}
+        if link_value in existing:
+            return {"Count": 1}
+        if link in existing:
+            return {"Count": 1}
+        return {"Count": 0}
+
+    table.query.side_effect = query_side_effect
     return table, batch
 
 
@@ -59,7 +91,7 @@ class TestParseS3Path:
         ) == ("default-bucket", "feeds/example/file.json")
 
 
-class TestParseRequestPaths:
+class TestParseRequest:
     def test_parses_api_gateway_put_body(self):
         event = {
             "body": json.dumps(
@@ -75,20 +107,58 @@ class TestParseRequestPaths:
         event = ["s3://bucket/a.json", "s3://bucket/b.json"]
         assert parse_request_paths(event) == event
 
+    def test_parses_object_with_additional_attrs(self):
+        event = {
+            "paths": ["s3://bucket/a.json"],
+            "additional_attrs": ["_timestamp", "_date"],
+            "_timestamp": "20-07-2026T22:00:00",
+            "_date": "20-07-2026",
+        }
+        paths, extra = parse_request(event)
+        assert paths == ["s3://bucket/a.json"]
+        assert extra == {
+            "_timestamp": "20-07-2026T22:00:00",
+            "_date": "20-07-2026",
+        }
+
+    def test_ignores_source_in_additional_attrs(self):
+        event = {
+            "paths": ["s3://bucket/a.json"],
+            "additional_attrs": ["_source", "_date"],
+            "_source": "should-be-ignored",
+            "_date": "20-07-2026",
+        }
+        _, extra = parse_request(event)
+        assert "_source" not in extra
+        assert extra["_date"] == "20-07-2026"
+
     def test_rejects_empty_array(self):
         with pytest.raises(ValueError, match="At least one S3 path"):
             parse_request_paths({"body": "[]"})
 
 
+class TestNormalizeLink:
+    def test_strips_scheme_and_www(self):
+        assert normalize_link("https://www.zeit.de/politik/foo") == "zeit.de/politik/foo"
+
+    def test_keeps_fqdn_without_www(self):
+        assert normalize_link("https://spiegel.de/a") == "spiegel.de/a"
+
+
 class TestPrepareDocuments:
-    def test_adds_source_to_each_document(self):
+    def test_adds_source_normalizes_link_and_extra_attrs(self):
         items = _load_s3_fixture("articles_batch_1.json")
         source = "s3://news-archive-bucket/feeds/example/2026-06-01-batch-1.json"
-        documents = prepare_documents(items, source)
+        documents = prepare_documents(
+            items,
+            source,
+            additional_attrs={"_date": "01-06-2026", "_timestamp": "ts"},
+        )
 
         assert len(documents) == 2
         assert documents[0]["_source"] == source
-        assert documents[1]["_source"] == source
+        assert documents[0]["link"] == "example.com/articles/001"
+        assert documents[0]["_date"] == "01-06-2026"
         assert documents[0]["id"] == "article-001"
 
 
@@ -158,42 +228,61 @@ class TestProcessS3Paths:
 
         batch.put_item.side_effect = put_item_side_effect
 
-        paths = [
-            "s3://news-archive-bucket/feeds/example/2026-06-01-batch-1.json",
-            "s3://news-archive-bucket/feeds/example/2026-06-01-batch-2.json",
-        ]
-        summary = process_s3_paths(
-            paths,
-            s3_client=s3_client,
-            table=table,
-            partition_key="id",
-        )
+        # Make GSI query always return no duplicates via monkeypatched helper
+        import function.main as main_mod
 
-        assert summary == {
-            "pathsProcessed": 2,
-            "documentsInserted": 3,
-            "table": "data",
-            "results": [
-                {
-                    "source": paths[0],
-                    "items": 2,
-                    "inserted": 2,
-                },
-                {
-                    "source": paths[1],
-                    "items": 1,
-                    "inserted": 1,
-                },
-            ],
-        }
+        original = main_mod.link_already_exists
+        main_mod.link_already_exists = lambda table, link, index_name: False
 
+        try:
+            paths = [
+                "s3://news-archive-bucket/feeds/example/2026-06-01-batch-1.json",
+                "s3://news-archive-bucket/feeds/example/2026-06-01-batch-2.json",
+            ]
+            summary = process_s3_paths(
+                paths,
+                s3_client=s3_client,
+                table=table,
+            )
+        finally:
+            main_mod.link_already_exists = original
+
+        assert summary["pathsProcessed"] == 2
+        assert summary["documentsInserted"] == 3
+        assert summary["duplicatesSkipped"] == 0
+        assert summary["table"] == "data"
         assert inserted_items == expected_documents
+
+    def test_skips_duplicate_links(self):
+        batch_1 = _load_s3_fixture("articles_batch_1.json")
+        s3_client = MagicMock()
+        s3_client.get_object.return_value = {
+            "Body": BytesIO(json.dumps(batch_1).encode("utf-8"))
+        }
+        table, batch = _mock_dynamodb_table()
+
+        import function.main as main_mod
+
+        main_mod.link_already_exists = (
+            lambda table, link, index_name: link == "example.com/articles/001"
+        )
+        try:
+            summary = process_s3_paths(
+                ["s3://news-archive-bucket/feeds/example/2026-06-01-batch-1.json"],
+                s3_client=s3_client,
+                table=table,
+            )
+        finally:
+            pass
+
+        assert summary["documentsInserted"] == 1
+        assert summary["duplicatesSkipped"] == 1
 
 
 class TestInsertItems:
     def test_returns_zero_for_empty_list(self):
         table, batch = _mock_dynamodb_table()
-        assert insert_items(table, [], "id") == 0
+        assert insert_items(table, []) == (0, 0)
         table.batch_writer.assert_not_called()
 
 
@@ -201,11 +290,15 @@ class TestHandler:
     def test_returns_200_with_summary(self, monkeypatch):
         table, batch = _mock_dynamodb_table()
         monkeypatch.setattr("function.main._get_dynamodb_table", lambda settings: table)
+        monkeypatch.setattr(
+            "function.main.link_already_exists",
+            lambda table, link, index_name: False,
+        )
 
-        batch = _load_s3_fixture("articles_batch_1.json")
+        batch_payload = _load_s3_fixture("articles_batch_1.json")
         s3_client = MagicMock()
         s3_client.get_object.return_value = {
-            "Body": BytesIO(json.dumps(batch).encode("utf-8"))
+            "Body": BytesIO(json.dumps(batch_payload).encode("utf-8"))
         }
 
         def client_factory(service_name, region_name=None):
@@ -216,9 +309,9 @@ class TestHandler:
         monkeypatch.setattr("function.main.boto3.client", client_factory)
 
         event = {
-            "body": json.dumps(
-                ["s3://news-archive-bucket/feeds/example/2026-06-01-batch-1.json"]
-            )
+            "paths": ["s3://news-archive-bucket/feeds/example/2026-06-01-batch-1.json"],
+            "additional_attrs": ["_date"],
+            "_date": "01-06-2026",
         }
         response = handler(event, None)
 

@@ -3,18 +3,21 @@
     "id": "article-001",
     "title": "Erster Artikel",
     "publishedAt": "2026-06-01T10:00:00Z",
+    "link": "example.com/articles/001",
     "_source": "s3://news-archive-bucket/feeds/example/2026-06-01-batch-1.json"
   },
   {
     "id": "article-002",
     "title": "Zweiter Artikel",
     "publishedAt": "2026-06-01T11:00:00Z",
+    "link": "zeit.de/politik/002",
     "_source": "s3://news-archive-bucket/feeds/example/2026-06-01-batch-1.json"
   },
   {
     "id": "article-101",
     "title": "Dritter Artikel",
     "category": "politics",
+    "link": "spiegel.de/politik/101",
     "_source": "s3://news-archive-bucket/feeds/example/2026-06-01-batch-2.json"
   }
 ]
